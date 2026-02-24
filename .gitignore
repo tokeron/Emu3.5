@@ -33,6 +33,7 @@ Thumbs.db
 
 ### Project outputs and large artifacts
 outputs/
+outputs_*/
 logs/
 video_outputs/
 video_case/
@@ -40,6 +41,12 @@ checkpoints/
 weights/
 *.log
 *.mp4
+
+### Local session and experiment artifacts
+.claude/
+layer_skip.md
+sliding_puzzles_batch_*/
+images/
 
 ### Model files (large)
 *.bin

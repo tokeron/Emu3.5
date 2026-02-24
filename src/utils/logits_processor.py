@@ -118,12 +118,18 @@ class UnbatchedClassifierFreeGuidanceLogitsForVisualTokenProcessor(LogitsProcess
         else:
             self.unconditional_context["first_pass"] = False
 
-        out = self.model(
-            input_ids,
-            attention_mask=attention_mask,
-            use_cache=self.use_cache,
-            past_key_values=self.unconditional_context["past_key_values"],
-        )
+        if hasattr(self.model, "_suppress_hs_buffer"):
+            self.model._suppress_hs_buffer = True
+        try:
+            out = self.model(
+                input_ids,
+                attention_mask=attention_mask,
+                use_cache=self.use_cache,
+                past_key_values=self.unconditional_context["past_key_values"],
+            )
+        finally:
+            if hasattr(self.model, "_suppress_hs_buffer"):
+                self.model._suppress_hs_buffer = False
 
         if self.use_cache:
             self.unconditional_context["past_key_values"] = out.get("past_key_values", None)
@@ -136,12 +142,18 @@ class UnbatchedClassifierFreeGuidanceLogitsForVisualTokenProcessor(LogitsProcess
             else:
                 self.full_unconditional_context["first_pass"] = False
 
-            func_out = self.model(
-                input_ids,
-                attention_mask=attention_mask,
-                use_cache=self.use_cache,
-                past_key_values=self.full_unconditional_context["past_key_values"],
-            )
+            if hasattr(self.model, "_suppress_hs_buffer"):
+                self.model._suppress_hs_buffer = True
+            try:
+                func_out = self.model(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=self.use_cache,
+                    past_key_values=self.full_unconditional_context["past_key_values"],
+                )
+            finally:
+                if hasattr(self.model, "_suppress_hs_buffer"):
+                    self.model._suppress_hs_buffer = False
 
             if self.use_cache:
                 self.full_unconditional_context["past_key_values"] = out.get("past_key_values", None)

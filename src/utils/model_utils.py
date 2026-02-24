@@ -16,6 +16,7 @@ def build_emu3p5(
     vq_type="ibq",
     model_device="auto",
     vq_device="cuda:0",
+    image_logits_layer=None,
     **kwargs,
 ):
     if isinstance(model_device, int):
@@ -30,13 +31,14 @@ def build_emu3p5(
         model_path,
         trust_remote_code=True,
     )
+    if image_logits_layer is not None:
+        model_config.image_logits_layer = image_logits_layer
     model = Emu3ForCausalLM.from_pretrained(
         model_path,
         config=model_config,
         torch_dtype=torch.bfloat16,
         device_map=device_map,
         attn_implementation="flash_attention_2",
-        # attn_implementation="eager", # if you cann't install flash_attention
     )
     model.eval()
     

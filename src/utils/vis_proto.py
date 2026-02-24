@@ -6,7 +6,8 @@ import argparse
 import io
 import os
 import sys
-from typing import Iterable, Tuple
+import textwrap
+from typing import Iterable, Tuple, Optional
 
 import numpy as np
 from PIL import Image
@@ -26,34 +27,48 @@ def parse_story(input_path: str) -> story_pb.Story:
         return story
 
 
-def write_story_assets(story: story_pb.Story, output_path: str, generate_video: bool, fps: int) -> None:
+def write_story_assets(
+    story: story_pb.Story,
+    output_path: str,
+    generate_video: bool,
+    fps: int,
+    layer_tag: Optional[str] = None,
+) -> None:
     os.makedirs(output_path, exist_ok=True)
+    layer_suffix = f"_layer{layer_tag}" if layer_tag else ""
+
+    def wrap(text, width=90):
+        return '\n'.join(textwrap.fill(line, width) for line in text.splitlines())
 
     with open(os.path.join(output_path, "000_question.txt"), 'w') as f:
-        print(story.question, file=f)
+        print(wrap(story.question), file=f)
 
     if story.summary and story.summary.strip():
         with open(os.path.join(output_path, "000_global_cot.txt"), 'w') as f:
-            print(story.summary, file=f)
+            print(wrap(story.summary), file=f)
 
     idx = 1
 
     if len(story.reference_images) > 0:
         for i in range(len(story.reference_images)):
-            with open(os.path.join(output_path, f"{i:03d}_reference_image.png"), 'wb') as f:
+            with open(os.path.join(output_path, f"{i:03d}_reference_image{layer_suffix}.png"), 'wb') as f:
                 f.write(story.reference_images[i].image.image_data)
         idx = len(story.reference_images)
 
     for clip in story.clips:
         for segment in clip.segments:
             with open(os.path.join(output_path, f"{idx:03d}_text.txt"), 'w') as f:
-                print(segment.asr, file=f)
+                print(wrap(segment.asr), file=f)
             for image_idx, image in enumerate(segment.images):
-                with open(os.path.join(output_path, f"{idx:03d}_{image_idx:02d}_image.png"), 'wb') as f:
+                with open(
+                    os.path.join(output_path, f"{idx:03d}_{image_idx:02d}_image{layer_suffix}.png"), 'wb'
+                ) as f:
                     f.write(image.image.image_data)
                 if image.chain_of_thought and image.chain_of_thought.strip():
-                    with open(os.path.join(output_path, f"{idx:03d}_{image_idx:02d}_image_cot.txt"), 'w') as f:
-                        print(image.chain_of_thought, file=f)
+                    with open(
+                        os.path.join(output_path, f"{idx:03d}_{image_idx:02d}_image_cot{layer_suffix}.txt"), 'w'
+                    ) as f:
+                        print(wrap(image.chain_of_thought), file=f)
             idx += 1
 
     if generate_video:
@@ -120,18 +135,22 @@ def iter_proto_files(input_dir: str) -> Iterable[Tuple[str, str]]:
                 yield full_path, rel_path
 
 
-def process_single_file(input_path: str, output_path: str, generate_video: bool, fps: int) -> None:
+def process_single_file(
+    input_path: str, output_path: str, generate_video: bool, fps: int, layer_tag: Optional[str] = None
+) -> None:
     story = parse_story(input_path)
-    write_story_assets(story, output_path, generate_video, fps)
+    write_story_assets(story, output_path, generate_video, fps, layer_tag=layer_tag)
     print(f"Visualization saved to: {output_path}")
 
 
-def process_directory(input_dir: str, output_root: str, generate_video: bool, fps: int) -> None:
+def process_directory(
+    input_dir: str, output_root: str, generate_video: bool, fps: int, layer_tag: Optional[str] = None
+) -> None:
     has_processed = False
     for abs_proto_path, rel_proto_path in iter_proto_files(input_dir):
         rel_without_ext, _ = os.path.splitext(rel_proto_path)
         target_dir = os.path.join(output_root, rel_without_ext)
-        process_single_file(abs_proto_path, target_dir, generate_video, fps)
+        process_single_file(abs_proto_path, target_dir, generate_video, fps, layer_tag=layer_tag)
         has_processed = True
 
     if not has_processed:
@@ -155,17 +174,19 @@ def main():
     parser.add_argument('--output', '-o', help='Output directory path (optional)')
     parser.add_argument('--video', action='store_true', help='Generate video from protobuf content')
     parser.add_argument('--fps', type=int, default=1, help='Frames per second for video (default: 1)')
+    parser.add_argument('--layer', help='Optional layer tag to suffix image filenames')
     args = parser.parse_args()
 
     input_path = os.path.abspath(args.input)
     output_path = os.path.abspath(args.output) if args.output else None
+    layer_tag = args.layer if args.layer is not None else os.getenv("EMU_IMAGE_LAYER")
 
     if os.path.isdir(input_path):
         output_root = output_path if output_path else default_output_for_directory(input_path)
-        process_directory(input_path, output_root, args.video, args.fps)
+        process_directory(input_path, output_root, args.video, args.fps, layer_tag=layer_tag)
     elif os.path.isfile(input_path):
         target_output = output_path if output_path else default_output_for_file(input_path)
-        process_single_file(input_path, target_output, args.video, args.fps)
+        process_single_file(input_path, target_output, args.video, args.fps, layer_tag=layer_tag)
     else:
         raise FileNotFoundError(f"Input path does not exist: {input_path}")
 

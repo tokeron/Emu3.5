@@ -124,6 +124,9 @@ def streaming_generate(
         )
         out_holder["token_ids"] = tokens
 
+    if hasattr(model, "reset_image_layer_buffer"):
+        model.reset_image_layer_buffer()
+
     th = threading.Thread(target=_worker, daemon=True)
     th.start()
 
@@ -225,13 +228,22 @@ def non_streaming_generate(
         pad_token_id=cfg.special_token_ids["PAD"],
         eos_token_id=cfg.special_token_ids["EOS"],
     )
+    if hasattr(model, "reset_image_layer_buffer"):
+        model.reset_image_layer_buffer()
+
     token_ids = model.generate(
         input_ids,
         generation_config,
         logits_processor=logits_processor,
     )
     gen_token_ids = token_ids[:, input_ids_len:]
-    return gen_token_ids[0].detach().cpu().numpy()
+    result = gen_token_ids[0].detach().cpu().numpy()
+
+    # Remap image visual tokens to intermediate-layer predictions when configured.
+    if hasattr(model, "get_image_layer_sequence") and model._image_layer_hs_buf:
+        result = model.get_image_layer_sequence(result, tokenizer)
+
+    return result
 
 
 def build_logits_processor(
@@ -308,17 +320,31 @@ def decode_image(image_string, tokenizer, vision_tokenizer):
         if len(token_ids) > 0:
             row_token = [int(m) for m in token_ids]
             image.append(row_token)
+
+    n_rows = len(image)
+    row_widths = [len(r) for r in image]
+    n_total_tokens = len(re.findall(r"<\|[^|>]+\|>", image_string))
+    print(f"[decode_image] grid: {n_rows} rows, widths={set(row_widths) if row_widths else 'none'}, "
+          f"total tokens in string={n_total_tokens}", flush=True)
+
+    if n_rows == 0:
+        print(f"[decode_image] FAILED: no visual token rows found — "
+              f"intermediate layer may have predicted non-visual tokens", flush=True)
+        return None
+
     try:
         image = torch.tensor(
             image, dtype=torch.long, device=next(iter(vision_tokenizer.parameters())).device
         )
         h, w = image.shape
+        print(f"[decode_image] running VQ decode on {h}x{w} grid...", flush=True)
         image = vision_tokenizer.decode_code(image[None], shape=(1, h, w, 256)).float()
         image = image[0].permute(1, 2, 0)
         image = Image.fromarray(
             ((image + 1.0) * 127.5).clamp(0, 255).detach().cpu().numpy().astype(np.uint8)
         )
+        print(f"[decode_image] OK: {image.width}x{image.height}px", flush=True)
         return image
     except Exception as ex:
-        print(f"decode image failed {ex}")
+        print(f"[decode_image] FAILED: {ex}", flush=True)
         return None

@@ -25,7 +25,8 @@
 """ PyTorch Emu3 model."""
 import math
 import warnings
-from typing import List, Optional, Tuple, Union
+import weakref
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -1122,9 +1123,23 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
         self.model = Emu3Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # WeakKeyDictionary: entries are auto-removed when the cache object is GC'd,
+        # preventing memory leaks and id() reuse bugs.
+        self._image_mode_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        # Forward hook for capturing intermediate-layer output.
+        self._image_layer_hook: Optional[Any] = None
+        self._intermediate_hs: Optional[torch.Tensor] = None
+        # Per-step hidden-state buffer, populated during image-mode decoding steps.
+        self._image_layer_hs_buf: List[torch.Tensor] = []
+        # Set True during unconditional CFG forward to avoid double-buffering.
+        self._suppress_hs_buffer: bool = False
 
         # Initialize weights and apply final processing
         self.post_init()
+
+        # Register hook now that layers are initialised (config may have image_logits_layer).
+        if getattr(config, "image_logits_layer", None) is not None:
+            self._register_image_layer_hook(config.image_logits_layer)
 
     def init_vision(self, tokenizer, vq_model):
         self.tokenizer = tokenizer
@@ -1238,10 +1253,17 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
         >>> answer = processor.batch_decode(outputs, skip_special_tokens=True)
         ```"""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # Clear any stale capture from a previous forward pass.
+        self._intermediate_hs = None
+
+        if use_cache and not isinstance(past_key_values, Cache):
+            past_key_values = DynamicCache.from_legacy_cache(past_key_values)
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
@@ -1257,12 +1279,28 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
         )
 
         hidden_states = outputs[0]
+        logits_hidden_states = hidden_states  # final layer always drives sampling
+
+        # If a hook is registered, buffer the intermediate hidden state for image-mode steps.
+        # The hook already ran during self.model(...) and set self._intermediate_hs.
+        # Skip buffering during unconditional CFG forward passes to avoid double-buffering.
+        if (not self._suppress_hs_buffer and
+                self._image_layer_hook is not None and self._intermediate_hs is not None and input_ids is not None):
+            in_image = self._in_image_mode_with_cache(input_ids, past_key_values, use_cache)
+            if in_image.any():
+                for b in range(input_ids.shape[0]):
+                    if in_image[b]:
+                        self._image_layer_hs_buf.append(
+                            self._intermediate_hs[b, -1, :].detach().clone()
+                        )
+            self._intermediate_hs = None  # release reference
+
         if self.config.pretraining_tp > 1:
             lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
-            logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
+            logits = [F.linear(logits_hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
             logits = torch.cat(logits, dim=-1)
         else:
-            logits = self.lm_head(hidden_states)
+            logits = self.lm_head(logits_hidden_states)
         logits = logits.float()
 
         loss = None
@@ -1289,6 +1327,280 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def _in_image_mode(self, input_ids: torch.LongTensor) -> torch.BoolTensor:
+        boi = self.config.boi_token_id
+        eoi = self.config.eoi_token_id
+        batch = input_ids.shape[0]
+        in_image = torch.zeros(batch, dtype=torch.bool, device=input_ids.device)
+        for b in range(batch):
+            seq = input_ids[b]
+            boi_idx = (seq == boi).nonzero().flatten()
+            if boi_idx.numel() == 0:
+                continue
+            eoi_idx = (seq == eoi).nonzero().flatten()
+            last_boi = boi_idx[-1].item()
+            if eoi_idx.numel() == 0:
+                in_image[b] = True
+            else:
+                last_eoi = eoi_idx[-1].item()
+                in_image[b] = last_boi > last_eoi
+        return in_image
+
+    def _in_image_mode_with_cache(
+        self,
+        input_ids: torch.LongTensor,
+        past_key_values: Optional[Cache],
+        use_cache: bool,
+    ) -> torch.BoolTensor:
+        if not use_cache or past_key_values is None:
+            return self._in_image_mode(input_ids)
+
+        # Use the cache object itself as the key (WeakKeyDictionary holds a weak ref,
+        # so the entry is removed automatically when the cache is GC'd).
+        state = self._image_mode_cache.get(past_key_values)
+
+        if state is None or input_ids.shape[1] > 1 or state.shape[0] != input_ids.shape[0]:
+            state = self._in_image_mode(input_ids)
+        else:
+            state = self._update_image_mode_state(state, input_ids)
+
+        self._image_mode_cache[past_key_values] = state
+        return state
+
+    def _update_image_mode_state(
+        self, state: torch.BoolTensor, input_ids: torch.LongTensor
+    ) -> torch.BoolTensor:
+        boi = self.config.boi_token_id
+        eoi = self.config.eoi_token_id
+        batch = input_ids.shape[0]
+        new_state = state.clone()
+        for b in range(batch):
+            seq = input_ids[b]
+            boi_idx = (seq == boi).nonzero().flatten()
+            eoi_idx = (seq == eoi).nonzero().flatten()
+            if boi_idx.numel() == 0 and eoi_idx.numel() == 0:
+                continue
+            if boi_idx.numel() == 0:
+                new_state[b] = False
+            elif eoi_idx.numel() == 0:
+                new_state[b] = True
+            else:
+                new_state[b] = boi_idx[-1].item() > eoi_idx[-1].item()
+        return new_state
+
+    # ------------------------------------------------------------------
+    # Intermediate-layer image decoding helpers
+    # ------------------------------------------------------------------
+
+    def _register_image_layer_hook(self, layer_idx: int) -> None:
+        """Attach a forward hook to decoder layer `layer_idx` to capture its raw output."""
+        if self._image_layer_hook is not None:
+            self._image_layer_hook.remove()
+            self._image_layer_hook = None
+
+        num_layers = len(self.model.layers)
+        if layer_idx < 0:
+            layer_idx = num_layers + layer_idx
+        if not (0 <= layer_idx < num_layers):
+            raise ValueError(
+                f"image_logits_layer={layer_idx} is out of range [0, {num_layers - 1}]"
+            )
+
+        def _hook(module, input, output):
+            # output[0] is the hidden states tensor (raw, before any norm).
+            self._intermediate_hs = output[0]
+
+        self._image_layer_hook = self.model.layers[layer_idx].register_forward_hook(_hook)
+
+    def reset_image_layer_buffer(self) -> None:
+        """Reset the hidden-state buffer. Must be called before each model.generate() call."""
+        self._image_layer_hs_buf = []
+
+    def get_image_layer_sequence(self, result_tokens, tokenizer):
+        """Replace visual-token positions in `result_tokens` with intermediate-layer predictions.
+
+        `result_tokens` is a 1-D numpy array of *generated* token IDs (prompt excluded),
+        as returned by non_streaming_generate.  Returns a modified copy with image visual
+        tokens remapped to what layer `image_logits_layer` would have predicted.
+
+        Structural tokens (EOL, EOF, TMS, …) between BOI and EOI are left untouched so
+        the row-split structure consumed by `decode_image` is preserved.
+        """
+        import numpy as np
+
+        if not self._image_layer_hs_buf:
+            return result_tokens
+
+        # Batch-project all buffered hidden states through norm + lm_head in one shot.
+        norm_weight = next(self.model.norm.parameters())
+        hs = torch.stack(self._image_layer_hs_buf, dim=0).to(
+            device=norm_weight.device, dtype=norm_weight.dtype
+        )
+        normed = self.model.norm(hs)
+        with torch.no_grad():
+            logits = self.lm_head(normed)           # (N, vocab_size)
+        intermediate_ids = logits.argmax(dim=-1).cpu().tolist()  # list[int], length N
+
+        boi_id = self.config.boi_token_id
+        eoi_id = self.config.eoi_token_id
+
+        # Build the set of structural token IDs that must not be remapped.
+        structural_ids = {boi_id, eoi_id}
+        for attr in ("eol_token", "eof_token", "tms_token", "bss_token", "ess_token"):
+            tok_str = getattr(tokenizer, attr, None)
+            if tok_str is not None:
+                tid = tokenizer.convert_tokens_to_ids(tok_str)
+                if tid is not None:
+                    structural_ids.add(tid)
+
+        # Only substitute predictions that are valid visual tokens (safety guard).
+        # Without this check a prediction of e.g. EOL at a visual position would split
+        # image rows at the wrong place, producing a jagged grid and decode failures.
+        import re as _re
+        _VIS_RE = _re.compile(r"^<\|visual token \d+\|>$")
+
+        tokens = result_tokens.copy() if isinstance(result_tokens, np.ndarray) else result_tokens.clone()
+        buf_offset = 0
+        i = 0
+
+        while i < len(tokens):
+            if int(tokens[i]) == boi_id:
+                # Find the matching EOI.
+                j = i + 1
+                while j < len(tokens) and int(tokens[j]) != eoi_id:
+                    j += 1
+
+                # tokens[i+1 : j] are the M tokens between BOI and EOI.
+                # Buffer has M entries for these positions, then +1 for the EOI prediction.
+                for k in range(i + 1, j):
+                    tok_id = int(tokens[k])
+                    if tok_id not in structural_ids and buf_offset < len(intermediate_ids):
+                        pred_id = intermediate_ids[buf_offset]
+                        pred_str = tokenizer.convert_ids_to_tokens(pred_id)
+                        if isinstance(pred_str, bytes):
+                            pred_str = ""
+                        if _VIS_RE.fullmatch(pred_str or ""):
+                            tokens[k] = pred_id
+                    buf_offset += 1  # advance for every position, visual or structural
+
+                buf_offset += 1  # skip the EOI-prediction entry
+                i = j + 1
+            else:
+                i += 1
+
+        return tokens
+
+    def remap_image_str(self, image_str: str, tokenizer, buf_offset: int):
+        """Remap visual tokens in *image_str* (text form, BOI…EOI) using buffered
+        intermediate-layer predictions.  Called by streaming_generate after each
+        complete image is collected.
+
+        Returns (remapped_image_str, new_buf_offset).
+        The buf_offset advances by 1 + n_hw + M per image (1 for the BOI step,
+        n_hw for the plain-text hw-dimension tokens like "45*45", M for the visual grid).
+        If the hook is not registered or the buffer is empty, returns the input unchanged.
+        """
+        import re as _re
+
+        if not self._image_layer_hs_buf or self._image_layer_hook is None:
+            return image_str, buf_offset
+
+        boi_str = tokenizer.boi_token
+        eoi_str = tokenizer.eoi_token
+
+        TOKEN_RE = _re.compile(r"<\|[^|>]+\|>")
+        token_spans = TOKEN_RE.findall(image_str)
+
+        # Collect the M tokens between BOI and EOI (exclusive).
+        inner_tokens: List[str] = []
+        in_seg = False
+        for tok in token_spans:
+            if tok == boi_str:
+                in_seg = True
+                continue
+            if tok == eoi_str:
+                in_seg = False
+                continue
+            if in_seg:
+                inner_tokens.append(tok)
+
+        M = len(inner_tokens)
+
+        # Count plain-text (non-<|...|>) tokens between BOI and EOI — these are the hw
+        # dimension tokens like "45*45".  The forward-pass buffer is appended for EVERY
+        # in-image-mode step, including both this BOI step and these hw plain-text steps,
+        # so the offset must advance by 1 (BOI) + n_hw + M instead of just M + 1.
+        boi_pos = image_str.find(boi_str)
+        eoi_pos = image_str.find(eoi_str)
+        if boi_pos != -1 and eoi_pos != -1:
+            inner_str = image_str[boi_pos + len(boi_str): eoi_pos]
+            non_special = TOKEN_RE.sub("", inner_str).strip()
+            n_hw = len(tokenizer.encode(non_special, add_special_tokens=False)) if non_special else 0
+        else:
+            n_hw = 0
+        buf_stride = 1 + n_hw + M  # 1 for BOI step, n_hw for hw tokens, M for visual grid
+
+        # Compute original row widths (visual tokens per EOL-delimited row) for diagnostics.
+        _eol = getattr(tokenizer, "eol_token", None)
+        _vis_re_diag = _re.compile(r"^<\|visual token \d+\|>$")
+        orig_rows = []
+        cur_row = 0
+        for t in inner_tokens:
+            if t == _eol:
+                orig_rows.append(cur_row)
+                cur_row = 0
+            elif _vis_re_diag.fullmatch(t):
+                cur_row += 1
+        if cur_row > 0:
+            orig_rows.append(cur_row)
+        print(
+            f"[remap_image_str] buf_offset={buf_offset}, M={M}, n_hw={n_hw}, buf_stride={buf_stride}, "
+            f"buf_total={len(self._image_layer_hs_buf)}, "
+            f"orig_rows({len(orig_rows)})={set(orig_rows) if orig_rows else 'none'}",
+            flush=True,
+        )
+
+        # buf layout per image: [BOI_HS, hw0_HS, ..., hw_{n_hw-1}_HS, IMG_HS, vis_HS, ...]
+        # hs_buf[buf_offset + n_hw + k] is the HS that predicts inner_tokens[k].
+        # Start the slice at n_hw so that hs_slice[k] aligns with inner_tokens[k].
+        hs_start = buf_offset + n_hw
+        hs_slice = self._image_layer_hs_buf[hs_start : hs_start + M]
+        if not hs_slice:
+            print(f"[remap_image_str] WARN: empty hs_slice at hs_start={hs_start}, skipping remap", flush=True)
+            return image_str, buf_offset + buf_stride
+
+        norm_weight = next(self.model.norm.parameters())
+        hs = torch.stack(hs_slice, dim=0).to(device=norm_weight.device, dtype=norm_weight.dtype)
+        normed = self.model.norm(hs)
+        with torch.no_grad():
+            logits = self.lm_head(normed)
+        intermediate_ids = logits.argmax(dim=-1).cpu().tolist()
+
+        structural_strs: set = set()
+        for attr in ("eol_token", "eof_token", "tms_token", "bss_token", "ess_token"):
+            s = getattr(tokenizer, attr, None)
+            if s:
+                structural_strs.add(s)
+
+        _VIS_RE = _re.compile(r"^<\|visual token \d+\|>$")
+        remapped_inner: List[str] = []
+        for i, tok_str in enumerate(inner_tokens):
+            if tok_str in structural_strs or i >= len(intermediate_ids):
+                remapped_inner.append(tok_str)
+            else:
+                pred_str = tokenizer.convert_ids_to_tokens(intermediate_ids[i])
+                if isinstance(pred_str, bytes):
+                    pred_str = ""
+                if _VIS_RE.fullmatch(pred_str or ""):
+                    remapped_inner.append(pred_str)
+                else:
+                    remapped_inner.append(tok_str)  # fallback to original
+
+        remapped = boi_str + "".join(remapped_inner) + eoi_str
+        return remapped, buf_offset + buf_stride
+
+    # ------------------------------------------------------------------
 
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
