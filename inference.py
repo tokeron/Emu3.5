@@ -115,8 +115,9 @@ def inference(
         cfg.streaming = True
         text_buf = ""
         img_idx = 0
-        _img_buf_offset = 0  # tracks remap_image_str consumption across images
-        _layer_tag = getattr(cfg, "image_logits_layer", None)
+        _img_buf_offset = 0  # shared offset across all layers (same stride per image)
+        _layer_cfg = getattr(cfg, "image_logits_layer", None)
+        _layer_tags = [] if _layer_cfg is None else ([_layer_cfg] if isinstance(_layer_cfg, int) else list(_layer_cfg))
         preview_dir = osp.join(save_path, "preview")
         os.makedirs(preview_dir, exist_ok=True)
         try:
@@ -144,16 +145,32 @@ def inference(
                         print(f"[WARNING] Image #{pending} final-layer decode failed — skipping", flush=True)
                         proto_writer._get_last_image()
 
-                    # --- Image B: intermediate-layer decode (logit-lens remap) ---
-                    if isinstance(raw_img_str, str) and _layer_tag is not None and hasattr(model, "remap_image_str") and model._image_layer_hs_buf:
-                        remapped_str, _img_buf_offset = model.remap_image_str(raw_img_str, tokenizer, _img_buf_offset)
-                        print(f"[INFO] Image #{pending} decoding layer-{_layer_tag}...", flush=True)
-                        img_inter = decode_image(remapped_str, tokenizer, vq_model)
-                        if img_inter is not None:
-                            img_inter.save(osp.join(preview_dir, f"{name}_{img_idx:02d}_layer{_layer_tag}.png"))
-                            print(f"[INFO] Image #{img_idx} (layer {_layer_tag}) saved → preview/{name}_{img_idx:02d}_layer{_layer_tag}.png", flush=True)
-                        else:
-                            print(f"[WARNING] Image #{pending} layer-{_layer_tag} decode failed", flush=True)
+                    # --- Images B…G: intermediate-layer decodes (logit-lens remap) ---
+                    # All layers share the same buffer stride per image, so we advance
+                    # _img_buf_offset once (from the first layer's remap call) and reuse it.
+                    if isinstance(raw_img_str, str) and _layer_tags and hasattr(model, "remap_image_str"):
+                        new_offset = None
+                        for layer_idx in _layer_tags:
+                            buf = model._image_layer_hs_buf.get(layer_idx)
+                            if not buf:
+                                continue
+                            remapped_str, layer_new_off = model.remap_image_str(
+                                raw_img_str, tokenizer, _img_buf_offset, layer_idx
+                            )
+                            if new_offset is None:
+                                new_offset = layer_new_off  # capture stride from first layer
+                            if remapped_str is None:
+                                # remap_image_str already logged the failure
+                                continue
+                            print(f"[INFO] Image #{pending} decoding layer-{layer_idx}...", flush=True)
+                            img_inter = decode_image(remapped_str, tokenizer, vq_model)
+                            if img_inter is not None:
+                                img_inter.save(osp.join(preview_dir, f"{name}_{img_idx:02d}_layer{layer_idx}.png"))
+                                print(f"[INFO] Image #{img_idx} layer-{layer_idx} saved → preview/{name}_{img_idx:02d}_layer{layer_idx}.png", flush=True)
+                            else:
+                                print(f"[WARNING] Image #{pending} layer-{layer_idx} decode failed", flush=True)
+                        if new_offset is not None:
+                            _img_buf_offset = new_offset
 
                 elif ev["type"] == "broken_image":
                     pass  # normal intermediate streaming progress event, not an error

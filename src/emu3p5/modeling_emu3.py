@@ -1126,20 +1126,23 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
         # WeakKeyDictionary: entries are auto-removed when the cache object is GC'd,
         # preventing memory leaks and id() reuse bugs.
         self._image_mode_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-        # Forward hook for capturing intermediate-layer output.
-        self._image_layer_hook: Optional[Any] = None
-        self._intermediate_hs: Optional[torch.Tensor] = None
-        # Per-step hidden-state buffer, populated during image-mode decoding steps.
-        self._image_layer_hs_buf: List[torch.Tensor] = []
+        # Forward hooks for capturing intermediate-layer outputs (one per configured layer).
+        self._image_layer_hooks: dict = {}            # layer_idx -> hook handle
+        self._intermediate_hs: dict = {}              # layer_idx -> current Tensor (cleared each step)
+        # Per-layer hidden-state buffers, populated during image-mode decoding steps.
+        self._image_layer_hs_buf: dict = {}           # layer_idx -> List[Tensor]
         # Set True during unconditional CFG forward to avoid double-buffering.
         self._suppress_hs_buffer: bool = False
 
         # Initialize weights and apply final processing
         self.post_init()
 
-        # Register hook now that layers are initialised (config may have image_logits_layer).
-        if getattr(config, "image_logits_layer", None) is not None:
-            self._register_image_layer_hook(config.image_logits_layer)
+        # Register hooks now that layers are initialised (config may have image_logits_layer).
+        layer_cfg = getattr(config, "image_logits_layer", None)
+        if layer_cfg is not None:
+            layers = [layer_cfg] if isinstance(layer_cfg, int) else list(layer_cfg)
+            for l in layers:
+                self._register_image_layer_hook(l)
 
     def init_vision(self, tokenizer, vq_model):
         self.tokenizer = tokenizer
@@ -1260,7 +1263,7 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # Clear any stale capture from a previous forward pass.
-        self._intermediate_hs = None
+        self._intermediate_hs = {}
 
         if use_cache and not isinstance(past_key_values, Cache):
             past_key_values = DynamicCache.from_legacy_cache(past_key_values)
@@ -1281,19 +1284,23 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
         hidden_states = outputs[0]
         logits_hidden_states = hidden_states  # final layer always drives sampling
 
-        # If a hook is registered, buffer the intermediate hidden state for image-mode steps.
-        # The hook already ran during self.model(...) and set self._intermediate_hs.
+        # If hooks are registered, buffer intermediate hidden states for image-mode steps.
+        # Hooks already ran during self.model(...) and populated self._intermediate_hs[layer].
         # Skip buffering during unconditional CFG forward passes to avoid double-buffering.
-        if (not self._suppress_hs_buffer and
-                self._image_layer_hook is not None and self._intermediate_hs is not None and input_ids is not None):
-            in_image = self._in_image_mode_with_cache(input_ids, past_key_values, use_cache)
-            if in_image.any():
-                for b in range(input_ids.shape[0]):
-                    if in_image[b]:
-                        self._image_layer_hs_buf.append(
-                            self._intermediate_hs[b, -1, :].detach().clone()
-                        )
-            self._intermediate_hs = None  # release reference
+        if not self._suppress_hs_buffer and self._image_layer_hooks and input_ids is not None:
+            any_hs = any(v is not None for v in self._intermediate_hs.values())
+            if any_hs:
+                in_image = self._in_image_mode_with_cache(input_ids, past_key_values, use_cache)
+                if in_image.any():
+                    for layer_idx, hs_tensor in self._intermediate_hs.items():
+                        if hs_tensor is None:
+                            continue
+                        for b in range(input_ids.shape[0]):
+                            if in_image[b]:
+                                self._image_layer_hs_buf[layer_idx].append(
+                                    hs_tensor[b, -1, :].detach().clone()
+                                )
+            self._intermediate_hs = {k: None for k in self._intermediate_hs}  # release refs
 
         if self.config.pretraining_tp > 1:
             lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
@@ -1394,11 +1401,8 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
     # ------------------------------------------------------------------
 
     def _register_image_layer_hook(self, layer_idx: int) -> None:
-        """Attach a forward hook to decoder layer `layer_idx` to capture its raw output."""
-        if self._image_layer_hook is not None:
-            self._image_layer_hook.remove()
-            self._image_layer_hook = None
-
+        """Attach a forward hook to decoder layer `layer_idx` to capture its raw output.
+        Can be called multiple times for different layers; each layer gets its own entry."""
         num_layers = len(self.model.layers)
         if layer_idx < 0:
             layer_idx = num_layers + layer_idx
@@ -1407,22 +1411,30 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
                 f"image_logits_layer={layer_idx} is out of range [0, {num_layers - 1}]"
             )
 
-        def _hook(module, input, output):
-            # output[0] is the hidden states tensor (raw, before any norm).
-            self._intermediate_hs = output[0]
+        # Remove existing hook for this layer if already registered.
+        if layer_idx in self._image_layer_hooks:
+            self._image_layer_hooks[layer_idx].remove()
 
-        self._image_layer_hook = self.model.layers[layer_idx].register_forward_hook(_hook)
+        def _hook(module, input, output, _idx=layer_idx):
+            # output[0] is the hidden states tensor (raw, before any norm).
+            self._intermediate_hs[_idx] = output[0]
+
+        self._image_layer_hooks[layer_idx] = self.model.layers[layer_idx].register_forward_hook(_hook)
+        self._image_layer_hs_buf[layer_idx] = []
+        self._intermediate_hs[layer_idx] = None
 
     def reset_image_layer_buffer(self) -> None:
-        """Reset the hidden-state buffer. Must be called before each model.generate() call."""
-        self._image_layer_hs_buf = []
+        """Reset all per-layer hidden-state buffers. Called before each model.generate()."""
+        for layer_idx in self._image_layer_hs_buf:
+            self._image_layer_hs_buf[layer_idx] = []
 
-    def get_image_layer_sequence(self, result_tokens, tokenizer):
+    def get_image_layer_sequence(self, result_tokens, tokenizer, layer_idx: int = None):
         """Replace visual-token positions in `result_tokens` with intermediate-layer predictions.
 
         `result_tokens` is a 1-D numpy array of *generated* token IDs (prompt excluded),
         as returned by non_streaming_generate.  Returns a modified copy with image visual
-        tokens remapped to what layer `image_logits_layer` would have predicted.
+        tokens remapped to what `layer_idx` would have predicted.
+        If layer_idx is None, uses the first registered layer.
 
         Structural tokens (EOL, EOF, TMS, …) between BOI and EOI are left untouched so
         the row-split structure consumed by `decode_image` is preserved.
@@ -1432,9 +1444,15 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
         if not self._image_layer_hs_buf:
             return result_tokens
 
+        if layer_idx is None:
+            layer_idx = next(iter(self._image_layer_hs_buf))
+        buf = self._image_layer_hs_buf.get(layer_idx, [])
+        if not buf:
+            return result_tokens
+
         # Batch-project all buffered hidden states through norm + lm_head in one shot.
         norm_weight = next(self.model.norm.parameters())
-        hs = torch.stack(self._image_layer_hs_buf, dim=0).to(
+        hs = torch.stack(buf, dim=0).to(
             device=norm_weight.device, dtype=norm_weight.dtype
         )
         normed = self.model.norm(hs)
@@ -1491,19 +1509,20 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
 
         return tokens
 
-    def remap_image_str(self, image_str: str, tokenizer, buf_offset: int):
+    def remap_image_str(self, image_str: str, tokenizer, buf_offset: int, layer_idx: int):
         """Remap visual tokens in *image_str* (text form, BOI…EOI) using buffered
-        intermediate-layer predictions.  Called by streaming_generate after each
-        complete image is collected.
+        intermediate-layer predictions for the given *layer_idx*.
 
         Returns (remapped_image_str, new_buf_offset).
         The buf_offset advances by 1 + n_hw + M per image (1 for the BOI step,
         n_hw for the plain-text hw-dimension tokens like "45*45", M for the visual grid).
-        If the hook is not registered or the buffer is empty, returns the input unchanged.
+        All layers share the same stride, so the returned offset can be reused across layers.
+        If the buffer for this layer is empty, returns the input unchanged.
         """
         import re as _re
 
-        if not self._image_layer_hs_buf or self._image_layer_hook is None:
+        buf = self._image_layer_hs_buf.get(layer_idx)
+        if not buf:
             return image_str, buf_offset
 
         boi_str = tokenizer.boi_token
@@ -1555,17 +1574,17 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
         if cur_row > 0:
             orig_rows.append(cur_row)
         print(
-            f"[remap_image_str] buf_offset={buf_offset}, M={M}, n_hw={n_hw}, buf_stride={buf_stride}, "
-            f"buf_total={len(self._image_layer_hs_buf)}, "
+            f"[remap_image_str layer={layer_idx}] buf_offset={buf_offset}, M={M}, n_hw={n_hw}, "
+            f"buf_stride={buf_stride}, buf_total={len(buf)}, "
             f"orig_rows({len(orig_rows)})={set(orig_rows) if orig_rows else 'none'}",
             flush=True,
         )
 
         # buf layout per image: [BOI_HS, hw0_HS, ..., hw_{n_hw-1}_HS, IMG_HS, vis_HS, ...]
-        # hs_buf[buf_offset + n_hw + k] is the HS that predicts inner_tokens[k].
+        # buf[buf_offset + n_hw + k] is the HS that predicts inner_tokens[k].
         # Start the slice at n_hw so that hs_slice[k] aligns with inner_tokens[k].
         hs_start = buf_offset + n_hw
-        hs_slice = self._image_layer_hs_buf[hs_start : hs_start + M]
+        hs_slice = buf[hs_start : hs_start + M]
         if not hs_slice:
             print(f"[remap_image_str] WARN: empty hs_slice at hs_start={hs_start}, skipping remap", flush=True)
             return image_str, buf_offset + buf_stride
@@ -1585,6 +1604,7 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
 
         _VIS_RE = _re.compile(r"^<\|visual token \d+\|>$")
         remapped_inner: List[str] = []
+        n_failed = 0
         for i, tok_str in enumerate(inner_tokens):
             if tok_str in structural_strs or i >= len(intermediate_ids):
                 remapped_inner.append(tok_str)
@@ -1595,7 +1615,16 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
                 if _VIS_RE.fullmatch(pred_str or ""):
                     remapped_inner.append(pred_str)
                 else:
-                    remapped_inner.append(tok_str)  # fallback to original
+                    n_failed += 1
+
+        if n_failed > 0:
+            n_vis = sum(1 for t in inner_tokens if _VIS_RE.fullmatch(t))
+            print(
+                f"[remap_image_str layer={layer_idx}] FAILED: {n_failed}/{n_vis} visual tokens "
+                f"predicted non-visual IDs — skipping image for this layer",
+                flush=True,
+            )
+            return None, buf_offset + buf_stride
 
         remapped = boi_str + "".join(remapped_inner) + eoi_str
         return remapped, buf_offset + buf_stride

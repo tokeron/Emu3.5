@@ -13,7 +13,7 @@ vq_type = "ibq"
 task_type = "howto"
 use_image = False
 
-exp_name = "01_repot_houseplant_layer_60_dual"
+exp_name = "01_repot_houseplant_multilayer_nofallback"
 save_path = f"./outputs_howto/{exp_name}"
 save_to_proto = True
 setup_logger(save_path)
@@ -25,7 +25,7 @@ unconditional_type = "no_text"
 classifier_free_guidance = 3.0
 max_new_tokens = 40000
 image_area = 518400
-image_logits_layer = 60
+image_logits_layer = [10, 20, 30, 40, 50, 60]
 
 def build_unc_and_template(task: str, with_image: bool):
     task_str = task.lower()
