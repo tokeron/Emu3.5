@@ -222,6 +222,7 @@ def main():
         model_device=hf_device,
         vq_device=vq_device,
         image_logits_layer=getattr(cfg, "image_logits_layer", None),
+        image_stop_layer=getattr(cfg, "image_stop_layer", None),
         **getattr(cfg, "diffusion_decoder_kwargs", {}),
     )
     t_load_end = time.perf_counter()

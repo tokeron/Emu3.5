@@ -17,6 +17,7 @@ def build_emu3p5(
     model_device="auto",
     vq_device="cuda:0",
     image_logits_layer=None,
+    image_stop_layer=None,
     **kwargs,
 ):
     if isinstance(model_device, int):
@@ -33,6 +34,8 @@ def build_emu3p5(
     )
     if image_logits_layer is not None:
         model_config.image_logits_layer = image_logits_layer
+    if image_stop_layer is not None:
+        model_config.image_stop_layer = image_stop_layer
     model = Emu3ForCausalLM.from_pretrained(
         model_path,
         config=model_config,

@@ -1133,6 +1133,13 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
         self._image_layer_hs_buf: dict = {}           # layer_idx -> List[Tensor]
         # Set True during unconditional CFG forward to avoid double-buffering.
         self._suppress_hs_buffer: bool = False
+        # Depth-freeze intervention: during image generation, freeze hidden states
+        # at stop_layer — all subsequent layers output the stop_layer result.
+        self._stop_layer_idx: Optional[int] = None
+        self._stop_layer_hs: Optional[torch.Tensor] = None
+        self._current_step_in_image: bool = False
+        self._prev_step_in_image: bool = False          # for detecting transitions
+        self._image_stop_hooks: dict = {}             # layer_idx -> hook handle
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1143,6 +1150,11 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
             layers = [layer_cfg] if isinstance(layer_cfg, int) else list(layer_cfg)
             for l in layers:
                 self._register_image_layer_hook(l)
+
+        # Register depth-freeze hooks (config may have image_stop_layer).
+        stop_cfg = getattr(config, "image_stop_layer", None)
+        if stop_cfg is not None:
+            self._register_image_stop_layer(stop_cfg)
 
     def init_vision(self, tokenizer, vq_model):
         self.tokenizer = tokenizer
@@ -1267,6 +1279,30 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
 
         if use_cache and not isinstance(past_key_values, Cache):
             past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+
+        # Determine if current step is in image mode (for depth-freeze intervention).
+        # Must run before self.model() so hooks see the correct flag.
+        if self._stop_layer_idx is not None and input_ids is not None:
+            self._current_step_in_image = self._in_image_mode_with_cache(
+                input_ids, past_key_values, use_cache
+            ).any().item()
+
+            # NOTE: Layers > stop_layer still run and update the KV cache during
+            # image mode.  Their KV entries are each layer's own projection
+            # (W_k_l, W_v_l) of the frozen stop-layer output — deterministic and
+            # internally consistent, but "shallow."  We intentionally do NOT trim
+            # or suppress these entries because the 4D attention mask is created
+            # once from layer-0's cache length and shared across all layers;
+            # any per-layer length divergence causes a shape mismatch crash.
+            # Post-image text tokens at deep layers therefore attend to the
+            # shallow image-position KVs.  This is an accepted artefact of the
+            # depth-freeze intervention.
+
+            if not self._current_step_in_image:
+                self._stop_layer_hs = None  # clear stale capture
+            self._prev_step_in_image = self._current_step_in_image
+        else:
+            self._current_step_in_image = False
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
@@ -1400,6 +1436,50 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
     # Intermediate-layer image decoding helpers
     # ------------------------------------------------------------------
 
+    def _register_image_stop_layer(self, stop_layer: int) -> None:
+        """Register depth-freeze hooks: during image generation, all layers after
+        `stop_layer` output the stop_layer hidden states unchanged.
+
+        Text generation is unaffected — full model depth is used for text tokens.
+        """
+        num_layers = len(self.model.layers)
+        if stop_layer < 0:
+            stop_layer += num_layers
+        if not (0 <= stop_layer < num_layers):
+            raise ValueError(
+                f"image_stop_layer={stop_layer} is out of range [0, {num_layers - 1}]"
+            )
+
+        # Remove any existing stop-layer hooks.
+        for h in self._image_stop_hooks.values():
+            h.remove()
+        self._image_stop_hooks.clear()
+
+        self._stop_layer_idx = stop_layer
+        self._stop_layer_hs = None
+        print(f"[depth-freeze] Registering stop at layer {stop_layer}/{num_layers-1}: "
+              f"image tokens will use frozen depth", flush=True)
+
+        # Hook on stop_layer: capture output.
+        def _capture_hook(module, input, output):
+            if self._current_step_in_image:
+                self._stop_layer_hs = output[0]
+            return output
+
+        self._image_stop_hooks[stop_layer] = (
+            self.model.layers[stop_layer].register_forward_hook(_capture_hook)
+        )
+
+        # Hooks on layers stop_layer+1 .. N-1: replace output with captured HS.
+        for idx in range(stop_layer + 1, num_layers):
+            def _replace_hook(module, input, output, _idx=idx):
+                if self._current_step_in_image and self._stop_layer_hs is not None:
+                    return (self._stop_layer_hs,) + output[1:]
+                return output
+            self._image_stop_hooks[idx] = (
+                self.model.layers[idx].register_forward_hook(_replace_hook)
+            )
+
     def _register_image_layer_hook(self, layer_idx: int) -> None:
         """Attach a forward hook to decoder layer `layer_idx` to capture its raw output.
         Can be called multiple times for different layers; each layer gets its own entry."""
@@ -1465,7 +1545,7 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
 
         # Build the set of structural token IDs that must not be remapped.
         structural_ids = {boi_id, eoi_id}
-        for attr in ("eol_token", "eof_token", "tms_token", "bss_token", "ess_token"):
+        for attr in ("eol_token", "eof_token", "tms_token", "bss_token", "ess_token", "img_token"):
             tok_str = getattr(tokenizer, attr, None)
             if tok_str is not None:
                 tid = tokenizer.convert_tokens_to_ids(tok_str)
@@ -1594,37 +1674,48 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
         normed = self.model.norm(hs)
         with torch.no_grad():
             logits = self.lm_head(normed)
-        intermediate_ids = logits.argmax(dim=-1).cpu().tolist()
+
+        # Unrestricted argmax (preferred when prediction is already a visual token).
+        unrestricted_ids = logits.argmax(dim=-1).cpu().tolist()
+        # Restricted argmax: only consider visual token IDs (>= BOV=151854).
+        BOV = 151854
+        vis_logits = logits[:, BOV:]                     # (M, vocab_size - BOV)
+        restricted_ids = (vis_logits.argmax(dim=-1) + BOV).cpu().tolist()
 
         structural_strs: set = set()
-        for attr in ("eol_token", "eof_token", "tms_token", "bss_token", "ess_token"):
+        for attr in ("eol_token", "eof_token", "tms_token", "bss_token", "ess_token", "img_token"):
             s = getattr(tokenizer, attr, None)
             if s:
                 structural_strs.add(s)
 
         _VIS_RE = _re.compile(r"^<\|visual token \d+\|>$")
         remapped_inner: List[str] = []
-        n_failed = 0
+        n_fallback = 0
         for i, tok_str in enumerate(inner_tokens):
-            if tok_str in structural_strs or i >= len(intermediate_ids):
+            if tok_str in structural_strs or i >= len(unrestricted_ids):
                 remapped_inner.append(tok_str)
             else:
-                pred_str = tokenizer.convert_ids_to_tokens(intermediate_ids[i])
+                # Try unrestricted prediction first.
+                pred_str = tokenizer.convert_ids_to_tokens(unrestricted_ids[i])
                 if isinstance(pred_str, bytes):
                     pred_str = ""
                 if _VIS_RE.fullmatch(pred_str or ""):
                     remapped_inner.append(pred_str)
                 else:
-                    n_failed += 1
+                    # Nearest visual token by logit score.
+                    vis_str = tokenizer.convert_ids_to_tokens(restricted_ids[i])
+                    if isinstance(vis_str, bytes):
+                        vis_str = ""
+                    remapped_inner.append(vis_str if vis_str else tok_str)
+                    n_fallback += 1
 
-        if n_failed > 0:
+        if n_fallback > 0:
             n_vis = sum(1 for t in inner_tokens if _VIS_RE.fullmatch(t))
             print(
-                f"[remap_image_str layer={layer_idx}] FAILED: {n_failed}/{n_vis} visual tokens "
-                f"predicted non-visual IDs — skipping image for this layer",
+                f"[remap_image_str layer={layer_idx}] {n_fallback}/{n_vis} visual tokens used "
+                f"restricted (nearest visual) argmax",
                 flush=True,
             )
-            return None, buf_offset + buf_stride
 
         remapped = boi_str + "".join(remapped_inner) + eoi_str
         return remapped, buf_offset + buf_stride
